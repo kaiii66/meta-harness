@@ -1,6 +1,7 @@
 """Inner Loop: Online and offline training with memory systems."""
 
 import json
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -10,6 +11,17 @@ from pathlib import Path
 from typing import Any
 
 from .memory_system import MemorySystem
+from .weave_tracing import (
+    init_weave,
+    start_session,
+    thread_local_turn,
+    weave_enabled,
+)
+
+# Solver Weave session — set once in __main__, read by predict_one workers.
+# Using a threading.local would lose the value across threads, so we use a
+# module-level reference which is safe for read-only access from threads.
+_solver_session = None
 
 
 class JSONLLogger:
@@ -221,7 +233,8 @@ def _run_offline_loop(
         }
 
     def predict_one(idx: int, ex: dict[str, Any]) -> tuple:
-        pred, meta = memory.predict(ex["input"])
+        with thread_local_turn(_solver_session, user_message=ex["input"]):
+            pred, meta = memory.predict(ex["input"])
         prompt_info = memory.get_last_prompt_info()
         raw = check_answer(pred, ex["target"], **_get_eval_kwargs(ex))
         ok, metrics = _unpack_eval_result(raw)
@@ -325,7 +338,8 @@ def run_inner_loop(
 
     def predict_one(idx: int, ex: dict[str, Any]) -> tuple:
         t0 = time.time()
-        pred, meta = memory.predict(ex["input"])
+        with thread_local_turn(_solver_session, user_message=ex["input"]):
+            pred, meta = memory.predict(ex["input"])
         prompt_info = memory.get_last_prompt_info()
         return idx, ex, pred, meta, prompt_info, time.time() - t0
 
@@ -437,7 +451,8 @@ def evaluate_memory(
         }
 
     def predict_one(idx: int, ex: dict[str, Any]) -> tuple:
-        pred, _ = memory.predict(ex["input"])
+        with thread_local_turn(_solver_session, user_message=ex["input"]):
+            pred, _ = memory.predict(ex["input"])
         prompt_info = memory.get_last_prompt_info()
         prompt_len = prompt_info.get("prompt_len") or 0
         prompt_text = prompt_info.get("prompt_text") or ""
@@ -516,6 +531,7 @@ def load_config() -> dict:
 if __name__ == "__main__":
     import argparse
 
+    from .benchmark import get_model_short_name
     from .data import ALL_TASKS, load_dataset_splits, load_dataset_splits_3way
 
     # Load config from YAML
@@ -658,6 +674,16 @@ if __name__ == "__main__":
     llm = LLM(model=model, api_base=api_base, temperature=args.temperature)
     memory = load_memory_system(path=args.memory, llm=llm)
     memory_name = Path(args.memory).stem
+
+    # --- Weave solver session ---
+    run_id = os.environ.get("META_HARNESS_RUN_ID", datetime.now().strftime("%Y%m%d_%H%M%S"))
+    init_weave()
+    _solver_session = start_session(
+        agent_name="text-classification-solver",
+        session_id=f"{run_id}/{args.dataset}/{memory_name}/{get_model_short_name(model)}/seed{args.seed}",
+        session_name=f"{memory_name} | {args.dataset}",
+    )
+    _solver_session.__enter__()
 
     il = cfg["inner_loop"]
     eval_interval = (
@@ -823,3 +849,16 @@ if __name__ == "__main__":
         with open(args.test_output, "w") as f:
             json.dump(_build_output(test_result), f, indent=2)
         print(f"Saved test results to {args.test_output}", flush=True)
+
+    # Close Weave solver session and flush all pending spans
+    if _solver_session is not None:
+        try:
+            _solver_session.__exit__(None, None, None)
+        except Exception:
+            pass
+    if weave_enabled():
+        try:
+            import weave
+            weave.finish()
+        except Exception:
+            pass

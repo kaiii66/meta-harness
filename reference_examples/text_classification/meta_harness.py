@@ -21,6 +21,7 @@ import yaml
 
 import claude_wrapper
 from benchmark import get_model_short_name, load_results
+from weave_tracing import init_weave, start_session
 
 EVOLVE_DIR = Path(__file__).parent
 CONFIG_PATH = EVOLVE_DIR / "config.yaml"
@@ -148,14 +149,14 @@ def count_iterations_from_summary():
     return max_iter
 
 
-def propose_claude(task_prompt, iteration, timeout=2400):
+def propose_claude(task_prompt, iteration, timeout=2400, weave_session=None):
     """Returns True if candidates were produced (pending_eval.json exists)."""
     os.environ.pop("CLAUDECODE", None)
     # Strip API key so claude CLI uses subscription auth (avoids rate limits)
     saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
     result = claude_wrapper.run(
         prompt=task_prompt,
-        model="opus",
+        model="haiku",
         allowed_tools=PROPOSER_ALLOWED_TOOLS,
         skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
         cwd=str(EVOLVE_DIR),
@@ -163,6 +164,7 @@ def propose_claude(task_prompt, iteration, timeout=2400):
         name=f"iter{iteration}",
         timeout_seconds=timeout,
         effort="max",
+        weave_session=weave_session,
     )
     # Restore API key
     if saved_key:
@@ -300,6 +302,18 @@ def run_evolve(args):
     if args.fresh:
         fresh_start()
 
+    # Propagate run_name so solver subprocesses can correlate their sessions
+    os.environ["META_HARNESS_RUN_ID"] = run_name
+
+    # Open a single Weave session for the proposer, kept alive across all iterations
+    init_weave()
+    proposer_session = start_session(
+        agent_name="meta-harness-proposer",
+        session_id=f"proposer/{run_name}",
+        session_name=f"proposer | {run_name}",
+    )
+    proposer_session.__enter__()
+
     print(
         f"{_ts()} {_bold('Evolution (memory systems)')}  "
         f"run={_cyan(run_name)}  model={_cyan(args.model)}  "
@@ -367,7 +381,7 @@ def run_evolve(args):
         # Propose
         propose_start = time.time()
         print(f"  {_ts()} {_cyan('proposing')} new candidates...", flush=True)
-        ok = propose_claude(task_prompt, iteration, timeout=args.propose_timeout)
+        ok = propose_claude(task_prompt, iteration, timeout=args.propose_timeout, weave_session=proposer_session)
         propose_time = time.time() - propose_start
 
         if not ok:
@@ -469,6 +483,17 @@ def run_evolve(args):
 
     # ── Phase Final: Test eval ─────────────────────────────────
     if _interrupted:
+        try:
+            proposer_session.__exit__(None, None, None)
+        except Exception:
+            pass
+        from weave_tracing import weave_enabled
+        if weave_enabled():
+            try:
+                import weave
+                weave.finish()
+            except Exception:
+                pass
         return
 
     print(f"\n{_ts()} {_bold('Phase Final: Test evaluation')}")
@@ -496,6 +521,19 @@ def run_evolve(args):
         print(result.stdout)
 
     print(f"\n{_ts()} {_bold('Evolution complete.')}")
+
+    # Close Weave proposer session and flush all pending spans
+    try:
+        proposer_session.__exit__(None, None, None)
+    except Exception:
+        pass
+    from weave_tracing import weave_enabled
+    if weave_enabled():
+        try:
+            import weave
+            weave.finish()
+        except Exception:
+            pass
 
 
 def main():

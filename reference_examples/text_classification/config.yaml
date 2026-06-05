@@ -20,7 +20,9 @@ inner_loop:
 
 # Models to test
 models:
-  - model: openrouter/openai/gpt-oss-120b
+  - model: openai/gpt-4o-mini
+  # Original paper model (requires OPENROUTER_API_KEY):
+  # - model: openrouter/openai/gpt-oss-120b
   # To use a custom OpenAI-compatible endpoint instead, switch to e.g.:
   # - model: gpt-oss-120b
   #   api_base: https://your-api-host/v1

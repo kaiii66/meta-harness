@@ -8,6 +8,7 @@ dependencies = [
     "openai-harmony",
     "tenacity>=8",
     "tqdm",
+    "weave",
 ]
 
 [tool.uv]

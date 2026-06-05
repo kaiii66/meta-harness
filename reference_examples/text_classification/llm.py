@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Protocol
 
+from .weave_tracing import make_message, make_usage, start_llm, weave_enabled
+
 from litellm import completion as litellm_completion
 from litellm import completion_cost, token_counter
 from openai_harmony import HarmonyEncodingName, Role, load_harmony_encoding
@@ -256,6 +258,31 @@ class ProviderLLM:
         cache_path = self._cache_path(prompt, system_prompt, kwargs)
         cached = self._load_cache(cache_path)
         if cached is not None:
+            if weave_enabled():
+                with start_llm(model=self._normalized_model()) as llm:
+                    if system_prompt:
+                        llm.record(
+                            input_messages=[
+                                make_message("system", system_prompt),
+                                make_message("user", prompt),
+                            ],
+                            output_messages=[make_message("assistant", cached["content"])],
+                            usage=make_usage(0, 0),
+                        )
+                    else:
+                        llm.record(
+                            input_messages=[make_message("user", prompt)],
+                            output_messages=[make_message("assistant", cached["content"])],
+                            usage=make_usage(0, 0),
+                        )
+                    # Mark as a cache hit via a custom attribute on the OTel span
+                    try:
+                        from opentelemetry import trace as _otel_trace
+                        _span = _otel_trace.get_current_span()
+                        if _span:
+                            _span.set_attribute("cache_hit", True)
+                    except Exception:
+                        pass
             return cached["content"]
 
         result = self._call_completion(prompt, system_prompt, kwargs)
@@ -265,6 +292,21 @@ class ProviderLLM:
             self.total_input_tokens += result["input_tokens"]
             self.total_output_tokens += result["output_tokens"]
             self.total_cost += result["cost"]
+
+        if weave_enabled():
+            input_msgs = []
+            if system_prompt:
+                input_msgs.append(make_message("system", system_prompt))
+            input_msgs.append(make_message("user", prompt))
+            with start_llm(model=self._normalized_model()) as llm:
+                llm.record(
+                    input_messages=input_msgs,
+                    output_messages=[make_message("assistant", result["content"])],
+                    usage=make_usage(
+                        input_tokens=result["input_tokens"],
+                        output_tokens=result["output_tokens"],
+                    ),
+                )
 
         return result["content"]
 

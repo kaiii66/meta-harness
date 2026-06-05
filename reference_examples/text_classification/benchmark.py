@@ -12,6 +12,12 @@ from pathlib import Path
 import yaml
 
 
+# Directory containing the `text_classification` package (its parent). Used as
+# PYTHONPATH for inner_loop subprocesses so `-m text_classification.inner_loop`
+# resolves regardless of the current working directory (main() chdir's to repo root).
+PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
+
+
 def load_config() -> dict:
     """Load config from config.yaml."""
     config_path = Path(__file__).parent / "config.yaml"
@@ -432,7 +438,7 @@ def build_val_runs(
                     desc = f"val/{dataset}/{mem_name}/{model_name}"
                     cmd = [
                         "env",
-                        "PYTHONPATH=..",
+                        f"PYTHONPATH={PACKAGE_PARENT}",
                         "uv",
                         "run",
                         "python",
@@ -519,7 +525,7 @@ def build_test_runs(
                     desc = f"test/{dataset}/{mem_name}/{model_name}"
                     cmd = [
                         "env",
-                        "PYTHONPATH=..",
+                        f"PYTHONPATH={PACKAGE_PARENT}",
                         "uv",
                         "run",
                         "python",

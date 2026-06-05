@@ -10,6 +10,7 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -475,6 +476,111 @@ def load_skills(skills, skill_dir=None):
     return loaded
 
 
+def _weave_enabled() -> bool:
+    """Check if Weave tracing is available (lazy import, no hard dependency)."""
+    if os.environ.get("WEAVE_DISABLED", ""):
+        return False
+    if not os.environ.get("WANDB_PROJECT", ""):
+        return False
+    try:
+        import weave  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _replay_to_weave(result, weave_session) -> None:
+    """Replay a completed SessionResult into Weave spans.
+
+    Walks result.raw_events and creates one turn (the whole session) with
+    nested LLM spans (per assistant message) and tool spans (per tool call).
+    This is called after the claude CLI subprocess finishes, so all events
+    are already available in memory — no streaming needed.
+    """
+    if not _weave_enabled():
+        return
+    if weave_session is None:
+        return
+
+    try:
+        import weave
+        from weave.session.session import Message, Usage
+    except ImportError:
+        return
+
+    try:
+        # One turn per proposer invocation
+        with weave_session.start_turn(user_message=result.prompt) as turn:  # noqa: F841
+            # Walk raw_events in order to reconstruct the conversation:
+            # each "assistant" event may have multiple tool_use blocks;
+            # paired "user" events carry tool_result blocks.
+            tool_call_map = {tc.tool_id: tc for tc in result.tool_calls}
+
+            for event in result.raw_events:
+                etype = event.get("type", "")
+
+                if etype == "assistant":
+                    msg = event.get("message", {})
+                    usage_data = msg.get("usage", {})
+                    content_blocks = msg.get("content", [])
+
+                    text_parts = [
+                        b["text"]
+                        for b in content_blocks
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    tool_blocks = [
+                        b
+                        for b in content_blocks
+                        if isinstance(b, dict) and b.get("type") == "tool_use"
+                    ]
+
+                    if not text_parts and not tool_blocks:
+                        continue
+
+                    with weave.start_llm(
+                        model=result.model or "claude",
+                        provider_name="anthropic",
+                    ) as llm:
+                        output_text = "".join(text_parts)
+                        input_msgs = [Message(role="user", content=result.prompt)]
+                        output_msgs = []
+                        if output_text:
+                            output_msgs.append(
+                                Message(role="assistant", content=output_text)
+                            )
+
+                        llm.record(
+                            input_messages=input_msgs,
+                            output_messages=output_msgs,
+                            usage=Usage(
+                                input_tokens=usage_data.get("input_tokens", 0),
+                                output_tokens=usage_data.get("output_tokens", 0),
+                                cache_creation_input_tokens=usage_data.get(
+                                    "cache_creation_input_tokens", 0
+                                ),
+                                cache_read_input_tokens=usage_data.get(
+                                    "cache_read_input_tokens", 0
+                                ),
+                            ),
+                        )
+
+                        # Tool calls are children of this LLM span
+                        for tb in tool_blocks:
+                            tid = tb.get("id", "")
+                            tc = tool_call_map.get(tid)
+                            tool_output = tc.output if tc else ""
+                            with weave.start_tool(
+                                name=tb.get("name", "unknown"),
+                                arguments=json.dumps(tb.get("input", {})),
+                                tool_call_id=tid,
+                            ) as tool:
+                                tool.result = tool_output
+    except Exception:
+        # Never let tracing errors break the main workflow
+        pass
+
+
 def _default_progress(event, tool_calls):
     """Default progress callback: print one line per tool call to stderr."""
     if event.get("type") != "assistant":
@@ -521,6 +627,7 @@ def run(
     disable_mcp=True,
     progress=True,
     effort=None,
+    weave_session=None,
 ):
     """Run `claude -p` and return parsed SessionResult. Logs to log_dir.
 
@@ -669,6 +776,7 @@ def run(
     result.skill = skill_info
     result.name = name
     log_session(result, log_dir)
+    _replay_to_weave(result, weave_session)
     return result
 
 
