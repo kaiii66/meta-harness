@@ -461,6 +461,7 @@ def evaluate_memory(
         raw = check_answer(pred, ex["target"], **_get_eval_kwargs(ex))
         ok, metrics = _unpack_eval_result(raw)
         result = {
+            "input": ex["input"],
             "prediction": pred,
             "target": ex["target"],
             "was_correct": ok,
@@ -787,6 +788,25 @@ if __name__ == "__main__":
 
     val_result = make_result(val_preds) if val_preds else None
     test_result = make_result(test_preds) if test_preds else None
+
+    # Log each candidate's val/test as a first-class weave Evaluation for the
+    # leaderboard (no-op when Weave is disabled). val drives the search
+    # leaderboard; test is the held-out reveal, run only on the frontier winner.
+    if weave_enabled():
+        from .weave_eval import log_weave_evaluation
+
+        if val_preds:
+            log_weave_evaluation(
+                model_name=memory_name,
+                dataset_name=f"{args.dataset}-val",
+                predictions=val_preds,
+            )
+        if test_preds:
+            log_weave_evaluation(
+                model_name=memory_name,
+                dataset_name=f"{args.dataset}-test",
+                predictions=test_preds,
+            )
 
     val_acc = val_result["accuracy"] if val_result else None
     test_acc = test_result["accuracy"] if test_result else None
