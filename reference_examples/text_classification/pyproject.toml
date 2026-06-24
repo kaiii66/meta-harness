@@ -6,6 +6,8 @@ dependencies = [
     "datasets",
     "litellm<1.82.7",
     "openai-harmony",
+    "openai",
+    "smolagents",
     "tenacity>=8",
     "tqdm",
     "weave",

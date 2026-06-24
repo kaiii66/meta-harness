@@ -5,9 +5,9 @@ dataset:
   num_test: 100
   overrides:
     # MCE tasks: use full official splits
-    USPTO:                     {num_train: 50, num_val: 30, num_test: 100}
+    # USPTO:                     {num_train: 50, num_val: 30, num_test: 100}
     Symptom2Disease:           {num_train: 200, num_val: 50, num_test: 212}
-    LawBench:                  {num_train: 200, num_val: 50, num_test: 100}
+    # LawBench:                  {num_train: 200, num_val: 50, num_test: 100}
 
 # Inner loop settings
 inner_loop:
@@ -20,12 +20,13 @@ inner_loop:
 
 # Models to test
 models:
-  - model: openai/gpt-4o-mini
+  # - model: openai/gpt-4o-mini
+  # - model: google/gemma-4-31B-it
   # Original paper model (requires OPENROUTER_API_KEY):
   # - model: openrouter/openai/gpt-oss-120b
   # To use a custom OpenAI-compatible endpoint instead, switch to e.g.:
-  # - model: gpt-oss-120b
-  #   api_base: https://your-api-host/v1
+  - model: google/gemma-4-31B-it
+    api_base: https://api.inference.wandb.ai/v1
 
 # Benchmark sweep settings
 benchmark:
@@ -34,9 +35,9 @@ benchmark:
 
 # Datasets to test
 datasets:
-  - USPTO
+  # - USPTO
   - Symptom2Disease
-  - LawBench
+  # - LawBench
 
 # Memory systems to test
 memory_systems:
@@ -44,3 +45,11 @@ memory_systems:
     - no_memory
     - fewshot_all
   proposed: []  # meta_harness.py writes candidate files into agents/ at runtime
+
+# Proposer settings (which agent writes new memory systems each iteration)
+proposer:
+  # backend: claude 
+  backend: smolagents          # "claude" (default) or "smolagents"
+  model_id: openai/gpt-oss-120b
+  api_base: https://api.inference.wandb.ai/v1
+  # api_key defaults to WANDB_API_KEY env var when using W&B Inference

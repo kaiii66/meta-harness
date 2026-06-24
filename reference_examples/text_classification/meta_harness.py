@@ -5,6 +5,18 @@ Uses claude_wrapper + meta-harness skill to propose new memory systems.
 
     uv run python meta_harness.py --iterations 20 --fresh
     uv run python meta_harness.py --iterations 10 --run-name my-run
+
+To use the smolagents/GLM-5.2 proposer instead of Claude Code:
+
+    META_HARNESS_PROPOSER=smolagents uv run python meta_harness.py --iterations 1
+
+Or in Marimo:
+
+    os.environ["META_HARNESS_PROPOSER"] = "smolagents"
+    # Optionally override model/endpoint:
+    # os.environ["SMOLAGENTS_MODEL_ID"] = "zai-org/GLM-5.2"
+    # os.environ["SMOLAGENTS_API_BASE"] = "https://api.inference.wandb.ai/v1"
+    # os.environ["SMOLAGENTS_API_KEY"]  = "<your-wandb-api-key>"
 """
 
 import argparse
@@ -20,11 +32,38 @@ from pathlib import Path
 import yaml
 
 import claude_wrapper
+import smolagents_wrapper
 from benchmark import get_model_short_name, load_results
 from weave_tracing import init_weave, start_session
 
 EVOLVE_DIR = Path(__file__).parent
 CONFIG_PATH = EVOLVE_DIR / "config.yaml"
+
+
+def _apply_proposer_config() -> bool:
+    """Read proposer settings from config.yaml and set env vars if not already set.
+
+    Returns True if the smolagents backend is active.
+    env var META_HARNESS_PROPOSER always takes precedence over config.yaml.
+    """
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg = yaml.safe_load(f)
+        p = cfg.get("proposer", {})
+        if p.get("backend") and "META_HARNESS_PROPOSER" not in os.environ:
+            os.environ["META_HARNESS_PROPOSER"] = p["backend"]
+        if p.get("model_id") and "SMOLAGENTS_MODEL_ID" not in os.environ:
+            os.environ["SMOLAGENTS_MODEL_ID"] = p["model_id"]
+        if p.get("api_base") and "SMOLAGENTS_API_BASE" not in os.environ:
+            os.environ["SMOLAGENTS_API_BASE"] = p["api_base"]
+        if p.get("api_key") and "SMOLAGENTS_API_KEY" not in os.environ:
+            os.environ["SMOLAGENTS_API_KEY"] = p["api_key"]
+    except Exception:
+        pass
+    return os.environ.get("META_HARNESS_PROPOSER", "").lower() == "smolagents"
+
+
+_USE_SMOLAGENTS = _apply_proposer_config()
 AGENTS_DIR = EVOLVE_DIR / "agents"
 BASELINE_FILES = {"__init__.py", "no_memory.py", "fewshot_memory.py", "fewshot_all.py"}
 
@@ -102,11 +141,42 @@ def _handle_signal(signum, frame):
     print("\nInterrupted, finishing current step...", flush=True)
 
 
-def run_cmd(cmd, timeout=7200, cwd=None):
+def _uv_available() -> bool:
+    """Return True if the `uv` binary is reachable."""
+    try:
+        subprocess.run(["uv", "--version"], capture_output=True, timeout=5)
+        return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+_UV_AVAILABLE: bool | None = None  # lazily cached
+
+
+def _python_cmd() -> list[str]:
+    """Return ['uv', 'run', 'python'] when uv is available, else [sys.executable]."""
+    global _UV_AVAILABLE
+    if _UV_AVAILABLE is None:
+        _UV_AVAILABLE = _uv_available()
+    if _UV_AVAILABLE:
+        return ["uv", "run", "python"]
+    return [sys.executable]
+
+
+def _python_env() -> dict:
+    """Return an env dict with PYTHONPATH set so text_classification is importable."""
+    env = os.environ.copy()
+    pp = str(EVOLVE_DIR.parent)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{pp}:{existing}" if existing else pp
+    return env
+
+
+def run_cmd(cmd, timeout=7200, cwd=None, env=None):
     """Wraps subprocess.run; returns CompletedProcess with returncode=124 on timeout."""
     try:
         return subprocess.run(
-            cmd, cwd=cwd, timeout=timeout, capture_output=True, text=True
+            cmd, cwd=cwd, timeout=timeout, capture_output=True, text=True, env=env
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
@@ -115,10 +185,9 @@ def run_cmd(cmd, timeout=7200, cwd=None):
 
 
 def run_benchmark(args):
-    return run_cmd(
-        ["uv", "run", "python", "benchmark.py", "--logs-dir", str(LOGS_DIR)] + args,
-        cwd=str(EVOLVE_DIR),
-    )
+    cmd = _python_cmd() + ["benchmark.py", "--logs-dir", str(LOGS_DIR)] + args
+    env = _python_env() if not _UV_AVAILABLE else None
+    return run_cmd(cmd, cwd=str(EVOLVE_DIR), env=env)
 
 
 def render_task_prompt(iteration, num_datasets):
@@ -150,25 +219,45 @@ def count_iterations_from_summary():
 
 
 def propose_claude(task_prompt, iteration, timeout=2400, weave_session=None):
-    """Returns True if candidates were produced (pending_eval.json exists)."""
-    os.environ.pop("CLAUDECODE", None)
-    # Strip API key so claude CLI uses subscription auth (avoids rate limits)
-    saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
-    result = claude_wrapper.run(
-        prompt=task_prompt,
-        model="haiku",
-        allowed_tools=PROPOSER_ALLOWED_TOOLS,
-        skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
-        cwd=str(EVOLVE_DIR),
-        log_dir=str(LOGS_DIR / "claude_sessions"),
-        name=f"iter{iteration}",
-        timeout_seconds=timeout,
-        effort="max",
-        weave_session=weave_session,
-    )
-    # Restore API key
-    if saved_key:
-        os.environ["ANTHROPIC_API_KEY"] = saved_key
+    """Returns True if candidates were produced (pending_eval.json exists).
+
+    Selects proposer based on META_HARNESS_PROPOSER env var:
+      - (unset / "claude")    — original Claude Code CLI via claude_wrapper
+      - "smolagents"          — pure-Python smolagents agent via smolagents_wrapper
+    """
+    if _USE_SMOLAGENTS:
+        result = smolagents_wrapper.run(
+            prompt=task_prompt,
+            allowed_tools=PROPOSER_ALLOWED_TOOLS,
+            skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
+            cwd=str(EVOLVE_DIR),
+            log_dir=str(LOGS_DIR / "smolagents_sessions"),
+            name=f"iter{iteration}",
+            timeout_seconds=timeout,
+            effort="max",
+            weave_session=weave_session,
+            progress=True,
+        )
+    else:
+        os.environ.pop("CLAUDECODE", None)
+        # Strip API key so claude CLI uses subscription auth (avoids rate limits)
+        saved_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        result = claude_wrapper.run(
+            prompt=task_prompt,
+            model="haiku",
+            allowed_tools=PROPOSER_ALLOWED_TOOLS,
+            skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
+            cwd=str(EVOLVE_DIR),
+            log_dir=str(LOGS_DIR / "claude_sessions"),
+            name=f"iter{iteration}",
+            timeout_seconds=timeout,
+            effort="max",
+            weave_session=weave_session,
+        )
+        # Restore API key
+        if saved_key:
+            os.environ["ANTHROPIC_API_KEY"] = saved_key
+
     if result.exit_code != 0:
         print(f"  {_red('proposer failed')} exit={result.exit_code}")
         if result.stderr:
@@ -183,17 +272,9 @@ def validate_candidates(candidates):
     valid = []
     for c in candidates:
         name = c["name"]
-        result = run_cmd(
-            [
-                "uv",
-                "run",
-                "python",
-                "-c",
-                f"from text_classification.agents.{name} import *; print('OK')",
-            ],
-            cwd=str(EVOLVE_DIR.parent),
-            timeout=30,
-        )
+        cmd = _python_cmd() + ["-c", f"from text_classification.agents.{name} import *; print('OK')"]
+        env = _python_env() if not _UV_AVAILABLE else None
+        result = run_cmd(cmd, cwd=str(EVOLVE_DIR.parent), timeout=30, env=env)
         if result.returncode == 0 and "OK" in result.stdout:
             print(f"    {_green('OK')} {name}")
             valid.append(c)
