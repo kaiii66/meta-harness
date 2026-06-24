@@ -6,17 +6,21 @@ Uses claude_wrapper + meta-harness skill to propose new memory systems.
     uv run python meta_harness.py --iterations 20 --fresh
     uv run python meta_harness.py --iterations 10 --run-name my-run
 
-To use the smolagents/GLM-5.2 proposer instead of Claude Code:
+To use an open-model proposer instead of Claude Code, set the backend via
+config.yaml (proposer.backend) or the META_HARNESS_PROPOSER env var:
 
-    META_HARNESS_PROPOSER=smolagents uv run python meta_harness.py --iterations 1
+    META_HARNESS_PROPOSER=opencode   uv run python meta_harness.py --iterations 1
 
 Or in Marimo:
 
-    os.environ["META_HARNESS_PROPOSER"] = "smolagents"
+    os.environ["META_HARNESS_PROPOSER"] = "opencode"
     # Optionally override model/endpoint:
-    # os.environ["SMOLAGENTS_MODEL_ID"] = "zai-org/GLM-5.2"
-    # os.environ["SMOLAGENTS_API_BASE"] = "https://api.inference.wandb.ai/v1"
-    # os.environ["SMOLAGENTS_API_KEY"]  = "<your-wandb-api-key>"
+    # os.environ["OPENCODE_MODEL_ID"] = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    # os.environ["OPENCODE_API_BASE"] = "https://api.inference.wandb.ai/v1"
+    # os.environ["OPENCODE_API_KEY"]  = "<your-wandb-api-key>"
+
+The "opencode" backend runs the open-source opencode CLI (built-in context
+management) against W&B Inference; see opencode_wrapper.py.
 """
 
 import argparse
@@ -32,7 +36,7 @@ from pathlib import Path
 import yaml
 
 import claude_wrapper
-import smolagents_wrapper
+import opencode_wrapper
 from benchmark import get_model_short_name, load_results
 from weave_tracing import init_weave, start_session
 
@@ -40,11 +44,14 @@ EVOLVE_DIR = Path(__file__).parent
 CONFIG_PATH = EVOLVE_DIR / "config.yaml"
 
 
-def _apply_proposer_config() -> bool:
+def _apply_proposer_config() -> str:
     """Read proposer settings from config.yaml and set env vars if not already set.
 
-    Returns True if the smolagents backend is active.
+    Returns the active proposer backend name ("claude" or "opencode").
     env var META_HARNESS_PROPOSER always takes precedence over config.yaml.
+
+    The proposer model/endpoint config is mirrored to the OPENCODE_* env vars
+    so the opencode wrapper can read it.
     """
     try:
         with open(CONFIG_PATH) as f:
@@ -52,18 +59,21 @@ def _apply_proposer_config() -> bool:
         p = cfg.get("proposer", {})
         if p.get("backend") and "META_HARNESS_PROPOSER" not in os.environ:
             os.environ["META_HARNESS_PROPOSER"] = p["backend"]
-        if p.get("model_id") and "SMOLAGENTS_MODEL_ID" not in os.environ:
-            os.environ["SMOLAGENTS_MODEL_ID"] = p["model_id"]
-        if p.get("api_base") and "SMOLAGENTS_API_BASE" not in os.environ:
-            os.environ["SMOLAGENTS_API_BASE"] = p["api_base"]
-        if p.get("api_key") and "SMOLAGENTS_API_KEY" not in os.environ:
-            os.environ["SMOLAGENTS_API_KEY"] = p["api_key"]
+        for key, oc_env in [
+            ("model_id", "OPENCODE_MODEL_ID"),
+            ("api_base", "OPENCODE_API_BASE"),
+            ("api_key", "OPENCODE_API_KEY"),
+        ]:
+            if p.get(key):
+                os.environ.setdefault(oc_env, p[key])
+        if p.get("provider"):
+            os.environ.setdefault("OPENCODE_PROVIDER", p["provider"])
     except Exception:
         pass
-    return os.environ.get("META_HARNESS_PROPOSER", "").lower() == "smolagents"
+    return os.environ.get("META_HARNESS_PROPOSER", "").lower() or "claude"
 
 
-_USE_SMOLAGENTS = _apply_proposer_config()
+_PROPOSER_BACKEND = _apply_proposer_config()
 AGENTS_DIR = EVOLVE_DIR / "agents"
 BASELINE_FILES = {"__init__.py", "no_memory.py", "fewshot_memory.py", "fewshot_all.py"}
 
@@ -154,12 +164,17 @@ _UV_AVAILABLE: bool | None = None  # lazily cached
 
 
 def _python_cmd() -> list[str]:
-    """Return ['uv', 'run', 'python'] when uv is available, else [sys.executable]."""
+    """Return a python invocation that uses the text_classification project venv.
+
+    With uv we pin --project to EVOLVE_DIR so the correct venv (with litellm,
+    datasets, etc.) is used regardless of the subprocess cwd — validate_candidates
+    runs from EVOLVE_DIR.parent, which would otherwise escape the project.
+    """
     global _UV_AVAILABLE
     if _UV_AVAILABLE is None:
         _UV_AVAILABLE = _uv_available()
     if _UV_AVAILABLE:
-        return ["uv", "run", "python"]
+        return ["uv", "run", "--project", str(EVOLVE_DIR), "python"]
     return [sys.executable]
 
 
@@ -223,15 +238,32 @@ def propose_claude(task_prompt, iteration, timeout=2400, weave_session=None):
 
     Selects proposer based on META_HARNESS_PROPOSER env var:
       - (unset / "claude")    — original Claude Code CLI via claude_wrapper
-      - "smolagents"          — pure-Python smolagents agent via smolagents_wrapper
+      - "opencode"            — opencode CLI (open model, built-in context mgmt) via opencode_wrapper
     """
-    if _USE_SMOLAGENTS:
-        result = smolagents_wrapper.run(
-            prompt=task_prompt,
+    if _PROPOSER_BACKEND == "opencode":
+        # TODO: We should NOT need this extra completion directive — the meta-harness
+        # SKILL.md already specifies the full workflow, and claude_wrapper runs it without
+        # any prompt augmentation. Open models driven via opencode (e.g. Qwen-235B) tend to
+        # plan-then-stop without it, so this is a stop-gap to force them to actually write
+        # the 3 candidate files + pending_eval.json. Remove once the skill/model reliably
+        # completes the workflow on its own (e.g. via a stronger model or skill tweak).
+        oc_prompt = task_prompt + (
+            "\n\n## IMPORTANT — complete the full workflow in THIS session\n"
+            "Follow the meta-harness skill end to end now. Do NOT stop after analysis or "
+            "after only describing ideas/plans. You MUST, in this same session:\n"
+            "1. Actually create 3 new memory-system files in `agents/` (real .py files with "
+            "real newlines — never literal '\\n' escape sequences).\n"
+            "2. Validate each imports cleanly.\n"
+            "3. Write pending_eval.json to the path given above.\n"
+            "4. Finish by printing the line: CANDIDATES: <name1>, <name2>, <name3>\n"
+            "Keep going until all 3 files and pending_eval.json exist on disk."
+        )
+        result = opencode_wrapper.run(
+            prompt=oc_prompt,
             allowed_tools=PROPOSER_ALLOWED_TOOLS,
             skills=[str(EVOLVE_DIR / ".claude/skills/meta-harness")],
             cwd=str(EVOLVE_DIR),
-            log_dir=str(LOGS_DIR / "smolagents_sessions"),
+            log_dir=str(LOGS_DIR / "opencode_sessions"),
             name=f"iter{iteration}",
             timeout_seconds=timeout,
             effort="max",

@@ -48,8 +48,10 @@ memory_systems:
 
 # Proposer settings (which agent writes new memory systems each iteration)
 proposer:
-  # backend: claude 
-  backend: smolagents          # "claude" (default) or "smolagents"
-  model_id: openai/gpt-oss-120b
+  # backend: claude            # original Claude Code CLI
+  backend: opencode            # opencode CLI: open model + built-in context management
+  # gpt-oss-120b emits malformed file writes (literal \n); Qwen-235B writes clean files.
+  model_id: Qwen/Qwen3-235B-A22B-Instruct-2507
   api_base: https://api.inference.wandb.ai/v1
+  provider: wandb              # opencode provider key (W&B Inference)
   # api_key defaults to WANDB_API_KEY env var when using W&B Inference
