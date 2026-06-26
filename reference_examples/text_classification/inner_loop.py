@@ -456,6 +456,8 @@ def evaluate_memory(
         prompt_info = memory.get_last_prompt_info()
         prompt_len = prompt_info.get("prompt_len") or 0
         prompt_text = prompt_info.get("prompt_text") or ""
+        if idx == 0:
+            print(f"\n--- PROMPT (example 0) ---\n{prompt_text}\n--- END PROMPT ---\n", flush=True)
         # Injected context = full prompt - test input (remainder is template + memory context)
         context_len = max(0, prompt_len - len(ex["input"])) if prompt_len else 0
         raw = check_answer(pred, ex["target"], **_get_eval_kwargs(ex))

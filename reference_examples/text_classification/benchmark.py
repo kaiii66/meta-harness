@@ -6,6 +6,8 @@ import json
 import os
 import random
 import re
+import subprocess
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -16,6 +18,29 @@ import yaml
 # PYTHONPATH for inner_loop subprocesses so `-m text_classification.inner_loop`
 # resolves regardless of the current working directory (main() chdir's to repo root).
 PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
+_PROJECT_DIR = Path(__file__).resolve().parent
+
+
+def _python_invocation() -> list[str]:
+    """Return the python launcher for inner_loop subprocesses.
+
+    Uses the current interpreter (sys.executable) instead of `uv run` when
+    META_HARNESS_NO_UV is set or the project .venv is absent — e.g. in Marimo,
+    where deps live in the kernel and `uv run` would use a mismatched venv
+    (symptom: "VIRTUAL_ENV=... does not match the project environment path").
+    """
+    if os.environ.get("META_HARNESS_NO_UV", "").lower() in ("1", "true", "yes"):
+        return [sys.executable]
+    if not (_PROJECT_DIR / ".venv").exists():
+        return [sys.executable]
+    try:
+        subprocess.run(["uv", "--version"], capture_output=True, timeout=5)
+        return ["uv", "run", "--project", str(_PROJECT_DIR), "python"]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return [sys.executable]
+
+
+_PY_INVOCATION = _python_invocation()
 
 
 def load_config() -> dict:
@@ -439,9 +464,7 @@ def build_val_runs(
                     cmd = [
                         "env",
                         f"PYTHONPATH={PACKAGE_PARENT}",
-                        "uv",
-                        "run",
-                        "python",
+                        *_PY_INVOCATION,
                         "-m",
                         "text_classification.inner_loop",
                         "--memory",
@@ -526,9 +549,7 @@ def build_test_runs(
                     cmd = [
                         "env",
                         f"PYTHONPATH={PACKAGE_PARENT}",
-                        "uv",
-                        "run",
-                        "python",
+                        *_PY_INVOCATION,
                         "-m",
                         "text_classification.inner_loop",
                         "--memory",

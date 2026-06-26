@@ -18,14 +18,15 @@ inner_loop:
   batch_size: 1
   seed: 42
 
-# Models to test
+# Models to test (inner-loop classifier model)
 models:
   # - model: openai/gpt-4o-mini
-  # - model: google/gemma-4-31B-it
   # Original paper model (requires OPENROUTER_API_KEY):
   # - model: openrouter/openai/gpt-oss-120b
-  # To use a custom OpenAI-compatible endpoint instead, switch to e.g.:
-  - model: google/gemma-4-31B-it
+  # W&B Inference (OpenAI-compatible): with api_base set, llm.py prepends
+  # `openai/`, so the model name must be a real W&B Inference model id.
+  # `google/gemma-4-31B-it` is NOT a valid id -> litellm errors -> 0 results.
+  - model: Qwen/Qwen3-235B-A22B-Instruct-2507
     api_base: https://api.inference.wandb.ai/v1
 
 # Benchmark sweep settings

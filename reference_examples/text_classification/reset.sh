@@ -14,5 +14,7 @@ echo "Cleaning logs..."
 rm -rf logs/
 echo "Cleaning results..."
 rm -rf results/
+echo "Cleaning opencode runtime config..."
+rm -f opencode.json AGENTS.md
 echo "Done. Ready for a fresh run:"
 echo "  uv run python meta_harness.py --iterations 1"

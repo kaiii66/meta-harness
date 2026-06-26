@@ -36,6 +36,18 @@ CACHE_DIR = Path(
     )
 )
 CACHE_VERSION = 1
+def _default_api_key_for(api_base: str | None) -> str | None:
+    """Resolve the auth key for a custom OpenAI-compatible endpoint.
+
+    W&B Inference (api.inference.wandb.ai) authenticates with WANDB_API_KEY, not
+    OPENAI_API_KEY. Without this, litellm sends the wrong key -> 401. Other
+    endpoints keep the existing behavior (None -> "local" placeholder).
+    """
+    if api_base and "inference.wandb.ai" in api_base:
+        return os.environ.get("WANDB_API_KEY")
+    return None
+
+
 KNOWN_PROVIDER_PREFIXES = (
     "anthropic/",
     "azure/",
@@ -144,7 +156,7 @@ class ProviderLLM:
         api_base: str | None = None,
     ):
         self.model = model
-        self.api_key = api_key
+        self.api_key = api_key or _default_api_key_for(api_base)
         self.api_base = api_base
         self.max_concurrent = max_concurrent
         self.total_input_tokens = 0

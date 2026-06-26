@@ -40,7 +40,12 @@ import opencode_wrapper
 from benchmark import get_model_short_name, load_results
 from weave_tracing import init_weave, start_session
 
-EVOLVE_DIR = Path(__file__).parent
+# .resolve() so EVOLVE_DIR is absolute even when launched via runpy.run_path
+# ("meta_harness.py" gives a relative __file__). A relative dir gets passed to
+# opencode as `--dir .`, which it resolves against its own git/worktree root
+# (e.g. /marimo) instead of the project — causing candidates to be written to
+# the wrong agents/ directory.
+EVOLVE_DIR = Path(__file__).parent.resolve()
 CONFIG_PATH = EVOLVE_DIR / "config.yaml"
 
 
@@ -152,7 +157,19 @@ def _handle_signal(signum, frame):
 
 
 def _uv_available() -> bool:
-    """Return True if the `uv` binary is reachable."""
+    """Return True if `uv` should be used to spawn subprocesses.
+
+    Returns False (use the current interpreter, sys.executable) when:
+      - META_HARNESS_NO_UV is set truthy, OR
+      - the project venv (EVOLVE_DIR/.venv) does not exist — e.g. in Marimo,
+        where deps are pip-installed into the kernel and `uv run` would try a
+        mismatched venv (symptom: "VIRTUAL_ENV=... does not match the project
+        environment path .venv ... and will be ignored").
+    """
+    if os.environ.get("META_HARNESS_NO_UV", "").lower() in ("1", "true", "yes"):
+        return False
+    if not (EVOLVE_DIR / ".venv").exists():
+        return False
     try:
         subprocess.run(["uv", "--version"], capture_output=True, timeout=5)
         return True
@@ -251,12 +268,15 @@ def propose_claude(task_prompt, iteration, timeout=2400, weave_session=None):
             "\n\n## IMPORTANT — complete the full workflow in THIS session\n"
             "Follow the meta-harness skill end to end now. Do NOT stop after analysis or "
             "after only describing ideas/plans. You MUST, in this same session:\n"
-            "1. Actually create 3 new memory-system files in `agents/` (real .py files with "
-            "real newlines — never literal '\\n' escape sequences).\n"
+            f"1. Create 3 new memory-system files as ABSOLUTE paths under `{AGENTS_DIR}/` "
+            "(e.g. `" + str(AGENTS_DIR / "<name>.py") + "`) — real .py files with real "
+            "newlines, never literal '\\n' escape sequences. Use these absolute paths for "
+            "all reads/writes; do NOT use a relative `agents/` directory.\n"
             "2. Validate each imports cleanly.\n"
-            "3. Write pending_eval.json to the path given above.\n"
+            f"3. Write pending_eval.json to this exact absolute path: `{PENDING_EVAL}`\n"
             "4. Finish by printing the line: CANDIDATES: <name1>, <name2>, <name3>\n"
-            "Keep going until all 3 files and pending_eval.json exist on disk."
+            f"Keep going until all 3 files exist under `{AGENTS_DIR}/` and `{PENDING_EVAL}` "
+            "exists on disk."
         )
         result = opencode_wrapper.run(
             prompt=oc_prompt,
@@ -312,8 +332,9 @@ def validate_candidates(candidates):
             valid.append(c)
         else:
             print(f"    {_red('FAIL')} {name}")
-            if result.stderr:
-                print(f"      {_dim(result.stderr[:200])}")
+            err = (result.stderr or result.stdout or "no output").strip()
+            # Show the tail (the actual exception line) rather than the truncated head.
+            print(f"      {_dim(err[-1200:])}")
     return valid
 
 
