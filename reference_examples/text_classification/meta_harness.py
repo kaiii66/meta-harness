@@ -79,6 +79,12 @@ def _apply_proposer_config() -> str:
 
 
 _PROPOSER_BACKEND = _apply_proposer_config()
+
+# When truthy, offload per-candidate validation benchmarking to parallel W&B
+# Serverless Sandboxes (one sandbox per candidate) instead of running them
+# sequentially in this process. See sandbox_benchmark.py.
+_SANDBOX = os.environ.get("META_HARNESS_SANDBOX", "").lower() in ("1", "true", "yes")
+
 AGENTS_DIR = EVOLVE_DIR / "agents"
 BASELINE_FILES = {"__init__.py", "no_memory.py", "fewshot_memory.py", "fewshot_all.py"}
 
@@ -553,20 +559,35 @@ def run_evolve(args):
         print(
             f"  {_ts()} {_cyan('benchmarking')} {len(valid_candidates)} system(s) x {len(datasets)} datasets"
         )
-        for ci, c in enumerate(valid_candidates):
-            if _interrupted:
-                break
-            name = c["name"]
-            print(
-                f"    [{ci + 1}/{len(valid_candidates)}] {_bold(name)}...", flush=True
-            )
-            t0 = time.time()
-            result = run_benchmark(["--memory", name])
-            elapsed = time.time() - t0
-            if result.returncode != 0:
-                print(f"      {_red('FAIL')} benchmark crashed ({_elapsed(elapsed)})")
-            else:
-                print(f"      {_green('OK')} ({_elapsed(elapsed)})")
+        if _SANDBOX:
+            # Fan out all candidates into parallel W&B Serverless Sandboxes; each
+            # writes its val.json/memory.json back into LOGS_DIR so the frontier
+            # logic below is unchanged.
+            import sandbox_benchmark
+
+            names = [c["name"] for c in valid_candidates]
+            try:
+                sandbox_benchmark.run_candidates(names, LOGS_DIR)
+            except Exception as e:  # noqa: BLE001
+                print(f"    {_red('FAIL')} sandbox benchmarking error: {e}")
+        else:
+            for ci, c in enumerate(valid_candidates):
+                if _interrupted:
+                    break
+                name = c["name"]
+                print(
+                    f"    [{ci + 1}/{len(valid_candidates)}] {_bold(name)}...",
+                    flush=True,
+                )
+                t0 = time.time()
+                result = run_benchmark(["--memory", name])
+                elapsed = time.time() - t0
+                if result.returncode != 0:
+                    print(
+                        f"      {_red('FAIL')} benchmark crashed ({_elapsed(elapsed)})"
+                    )
+                else:
+                    print(f"      {_green('OK')} ({_elapsed(elapsed)})")
         bench_time = time.time() - bench_start
 
         run_benchmark(["--frontier", "--model", model_short])
