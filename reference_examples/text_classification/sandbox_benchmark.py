@@ -18,9 +18,20 @@ downstream frontier/leaderboard logic (``benchmark.load_results`` /
 ``print_frontier`` / ``meta_harness.update_evolution_summary``) keeps working
 unchanged — it just reads the val.json files the sandboxes produced.
 
+Concurrency note: ``wandb.sandbox`` registers a process signal handler when a
+sandbox starts, and Python only permits ``signal.signal`` on the **main
+thread**. So we must NOT drive sandboxes from worker threads (doing so raises
+"signal only works in main thread of the main interpreter"). Instead we create
+all sandboxes on the main thread and rely on the SDK's own async ``exec`` —
+``sandbox.exec(...)`` returns a ``Process`` immediately and ``.result()`` blocks
+— launching each stage on every sandbox before awaiting it (a barrier per
+stage). That keeps tar -> pip -> run ordered within a sandbox while overlapping
+the slow inner_loop stage across all of them.
+
 This module is import-light at module scope; ``wandb.sandbox`` is imported
-lazily inside the worker so importing this file never fails when the sandbox
-extra isn't installed (e.g. local runs that never set META_HARNESS_SANDBOX).
+lazily inside ``run_candidates`` so importing this file never fails when the
+sandbox extra isn't installed (e.g. local runs that never set
+META_HARNESS_SANDBOX).
 """
 
 from __future__ import annotations
@@ -30,8 +41,6 @@ import json
 import os
 import sys
 import tarfile
-import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import benchmark
@@ -87,109 +96,69 @@ def _make_tarball(src_dir: Path) -> bytes:
     return buf.read()
 
 
-def _run_one(
+def _build_inner_cmd(
     *,
-    tar_bytes: bytes,
     candidate: str,
     dataset: str,
     seed: int,
     model: str,
     api_base: str | None,
-    logs_dir: Path,
     wandb_key: str,
-    deps: list[str],
     mode: str,
     num_epochs: int,
     temperature: float | None,
-) -> tuple[str, bool, str]:
-    """Run one candidate in its own sandbox; write val.json/memory.json back.
-
-    Returns (label, ok, message). ``ok`` is True only when a non-empty val.json
-    was retrieved and written locally.
-    """
-    from wandb.sandbox import Sandbox
-
-    model_short = get_model_short_name(model)
-    label = f"{dataset}/{candidate}/{model_short}/seed{seed}"
+) -> str:
+    """Build the bash command that runs inner_loop for one candidate in-sandbox."""
     n_train, n_val, n_test = get_dataset_sizes(dataset)
-
-    inner_parts = [
-        f"export WANDB_API_KEY={wandb_key}",
-        "export PYTHONPATH=$(pwd)",
-        (
-            "python -m text_classification.inner_loop "
-            f"--memory agents/{candidate}.py "
-            f"--dataset {dataset} "
-            f"--seed {seed} "
-            f"--model '{model}' "
-            f"--mode {mode} "
-            f"--num-train {n_train} --num-val {n_val} --num-test {n_test} "
-            "--val-output /tmp/val.json "
-            "--save-memory /tmp/memory.json "
-            "--log /tmp/log.jsonl"
-        ),
-    ]
-    inner_cmd = inner_parts[0] + " && " + inner_parts[1] + " && " + inner_parts[2]
+    cmd = (
+        f"export WANDB_API_KEY={wandb_key} && export PYTHONPATH=$(pwd) && "
+        "python -m text_classification.inner_loop "
+        f"--memory agents/{candidate}.py "
+        f"--dataset {dataset} "
+        f"--seed {seed} "
+        f"--model '{model}' "
+        f"--mode {mode} "
+        f"--num-train {n_train} --num-val {n_val} --num-test {n_test} "
+        "--val-output /tmp/val.json "
+        "--save-memory /tmp/memory.json "
+        "--log /tmp/log.jsonl"
+    )
     if api_base:
-        inner_cmd += f" --api-base '{api_base}'"
+        cmd += f" --api-base '{api_base}'"
     if mode == "offline" and num_epochs > 1:
-        inner_cmd += f" --num-epochs {num_epochs}"
+        cmd += f" --num-epochs {num_epochs}"
     if temperature is not None:
-        inner_cmd += f" --temperature {temperature}"
+        cmd += f" --temperature {temperature}"
+    return cmd
 
-    mounted_files = [{"mount_path": "tc.tar.gz", "file_content": tar_bytes}]
 
-    try:
-        with Sandbox.run(mounted_files=mounted_files) as sandbox:
-            sandbox.exec(["tar", "-xzf", "tc.tar.gz"], check=True).result()
-            sandbox.exec(["pip", "install", "-q", *deps], check=True).result()
+def _await_all(procs: list) -> list:
+    """Block on a list of sandbox exec Process handles, returning their results.
 
-            run = sandbox.exec(["bash", "-c", inner_cmd]).result()
-            val = sandbox.exec(
-                ["bash", "-c", "cat /tmp/val.json 2>/dev/null || true"]
-            ).result()
-            mem = sandbox.exec(
-                ["bash", "-c", "cat /tmp/memory.json 2>/dev/null || true"]
-            ).result()
-
-        val_text = (val.stdout or "").strip()
-        if run.returncode != 0 or not val_text:
-            tail = (run.stderr or run.stdout or "no output").strip()[-800:]
-            return label, False, f"exit={run.returncode}\n{tail}"
-
-        # Validate JSON before writing so we never persist a partial file.
-        try:
-            json.loads(val_text)
-        except json.JSONDecodeError as e:
-            return label, False, f"val.json not valid JSON: {e}"
-
-        rd = run_dir(logs_dir, dataset, candidate, model_short, seed)
-        rd.mkdir(parents=True, exist_ok=True)
-        (rd / "val.json").write_text(val_text)
-
-        mem_text = (mem.stdout or "").strip()
-        if mem_text:
-            (rd / "memory.json").write_text(mem_text)
-
-        return label, True, str(rd / "val.json")
-    except Exception:  # noqa: BLE001 — surface any sandbox/transport error per-candidate
-        return label, False, traceback.format_exc()[-1200:]
+    Each exec was already launched (the SDK starts it eagerly), so awaiting them
+    in sequence still lets the underlying commands run concurrently across
+    sandboxes — this is a per-stage barrier, not serial execution.
+    """
+    return [p.result() for p in procs]
 
 
 def run_candidates(
     candidate_names: list[str],
     logs_dir: Path,
     *,
-    max_parallel: int | None = None,
     deps: list[str] | None = None,
 ) -> dict[str, bool]:
     """Benchmark each candidate in its own sandbox, concurrently.
 
-    Builds one work item per (candidate, dataset, seed) using the harness
-    config (MODELS[0], DATASETS, SEEDS, per-dataset sizes), runs them via a
-    thread pool (one sandbox per work item), and writes each val.json/memory.json
-    back to the canonical local path. Returns {label: ok}.
+    Builds one work item per (candidate, dataset, seed) using the harness config
+    (MODELS[0], DATASETS, SEEDS, per-dataset sizes), creates one sandbox per work
+    item on the MAIN thread (required for the SDK's signal handler), and drives
+    them with the SDK's async exec using a barrier per stage (tar -> pip -> run
+    -> read-back). Each val.json/memory.json is written to the canonical local
+    path. Returns {label: ok}.
     """
+    from wandb.sandbox import Sandbox
+
     logs_dir = Path(logs_dir)
     if not candidate_names:
         return {}
@@ -199,6 +168,7 @@ def run_candidates(
     model_cfg = MODELS[0]
     model = model_cfg["model"]
     api_base = model_cfg.get("api_base")
+    model_short = get_model_short_name(model)
 
     il = benchmark._CONFIG.get("inner_loop", {})
     mode = il.get("mode", "online")
@@ -215,52 +185,90 @@ def run_candidates(
 
     resolved_deps = deps if deps is not None else _DEFAULT_DEPS
 
-    tar_bytes = _make_tarball(_PROJECT_DIR)
-
     work = [
         (candidate, dataset, seed)
         for candidate in candidate_names
         for dataset in DATASETS
         for seed in SEEDS
     ]
-    workers = max_parallel if max_parallel is not None else len(work)
-    workers = max(1, workers)
+    tar_bytes = _make_tarball(_PROJECT_DIR)
+    mounted = [{"mount_path": "tc.tar.gz", "file_content": tar_bytes}]
 
     print(
-        f"  sandbox: launching {len(work)} job(s) across {workers} parallel "
-        f"sandbox(es) (model={get_model_short_name(model)})",
+        f"  sandbox: launching {len(work)} job(s) in parallel "
+        f"(model={model_short})",
         flush=True,
     )
 
     results: dict[str, bool] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _run_one,
-                tar_bytes=tar_bytes,
+
+    # Create every sandbox on the main thread (the SDK installs a signal handler
+    # on start, which only works in the main thread).
+    sandboxes = [Sandbox.run(mounted_files=mounted) for _ in work]
+    try:
+        # Stage 1: extract the package payload in every sandbox.
+        _await_all([sb.exec(["tar", "-xzf", "tc.tar.gz"]) for sb in sandboxes])
+        # Stage 2: install deps (parallel across sandboxes).
+        _await_all([sb.exec(["pip", "install", "-q", *resolved_deps]) for sb in sandboxes])
+        # Stage 3: the slow inner_loop, overlapped across all sandboxes.
+        cmds = [
+            _build_inner_cmd(
                 candidate=candidate,
                 dataset=dataset,
                 seed=seed,
                 model=model,
                 api_base=api_base,
-                logs_dir=logs_dir,
                 wandb_key=wandb_key,
-                deps=resolved_deps,
                 mode=mode,
                 num_epochs=num_epochs,
                 temperature=temperature,
-            ): (candidate, dataset, seed)
+            )
             for (candidate, dataset, seed) in work
-        }
-        for fut in as_completed(futures):
-            label, ok, message = fut.result()
-            results[label] = ok
-            if ok:
-                print(f"    OK   {label}", flush=True)
-            else:
-                print(f"    FAIL {label}", flush=True)
-                for line in message.splitlines()[-8:]:
+        ]
+        runs = _await_all(
+            [sb.exec(["bash", "-c", cmd]) for sb, cmd in zip(sandboxes, cmds)]
+        )
+
+        # Stage 4: read each result back and write it to the canonical path.
+        for sb, run, (candidate, dataset, seed) in zip(sandboxes, runs, work):
+            label = f"{dataset}/{candidate}/{model_short}/seed{seed}"
+            val = sb.exec(
+                ["bash", "-c", "cat /tmp/val.json 2>/dev/null || true"]
+            ).result()
+            val_text = (val.stdout or "").strip()
+            if run.returncode != 0 or not val_text:
+                results[label] = False
+                print(f"    FAIL {label} exit={run.returncode}", flush=True)
+                tail = (run.stderr or run.stdout or "no output").strip()
+                for line in tail.splitlines()[-8:]:
                     print(f"      {line}", flush=True)
+                continue
+            try:
+                json.loads(val_text)
+            except json.JSONDecodeError as e:
+                results[label] = False
+                print(f"    FAIL {label} val.json not valid JSON: {e}", flush=True)
+                continue
+
+            rd = run_dir(logs_dir, dataset, candidate, model_short, seed)
+            rd.mkdir(parents=True, exist_ok=True)
+            (rd / "val.json").write_text(val_text)
+
+            mem = sb.exec(
+                ["bash", "-c", "cat /tmp/memory.json 2>/dev/null || true"]
+            ).result()
+            mem_text = (mem.stdout or "").strip()
+            if mem_text:
+                (rd / "memory.json").write_text(mem_text)
+
+            results[label] = True
+            print(f"    OK   {label}", flush=True)
+    finally:
+        for sb in sandboxes:
+            try:
+                sb.stop()
+            except Exception:
+                pass
 
     succeeded = sum(1 for ok in results.values() if ok)
     print(f"  sandbox: completed {succeeded}/{len(results)}", flush=True)
