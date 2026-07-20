@@ -218,7 +218,16 @@ def _parse_events(stdout: str, base_dir: Path = None):
                     rec["lines"] = str(out).count("\n") + 1
                 elif name in ("write", "edit", "patch"):
                     content = inp.get("content", "") or inp.get("newString", "") or ""
-                    files_written[rel] = {"lines_written": content.count("\n") + 1 if content else 0}
+                    content_text = (
+                        content
+                        if isinstance(content, str)
+                        else json.dumps(content, default=str)
+                    )
+                    files_written[rel] = {
+                        "lines_written": (
+                            content_text.count("\n") + 1 if content_text else 0
+                        )
+                    }
         elif etype == "text":
             t = part.get("text", "")
             if t:
