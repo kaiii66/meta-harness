@@ -10,7 +10,6 @@ import os
 import queue
 import re
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -503,8 +502,7 @@ def _replay_to_weave(result, weave_session) -> None:
         return
 
     try:
-        import weave
-        from weave.session.session import Message, Usage
+        from weave_tracing import make_message, make_usage, start_llm, start_tool
     except ImportError:
         return
 
@@ -538,22 +536,22 @@ def _replay_to_weave(result, weave_session) -> None:
                     if not text_parts and not tool_blocks:
                         continue
 
-                    with weave.start_llm(
+                    with start_llm(
                         model=result.model or "claude",
                         provider_name="anthropic",
                     ) as llm:
                         output_text = "".join(text_parts)
-                        input_msgs = [Message(role="user", content=result.prompt)]
+                        input_msgs = [make_message("user", result.prompt)]
                         output_msgs = []
                         if output_text:
                             output_msgs.append(
-                                Message(role="assistant", content=output_text)
+                                make_message("assistant", output_text)
                             )
 
                         llm.record(
                             input_messages=input_msgs,
                             output_messages=output_msgs,
-                            usage=Usage(
+                            usage=make_usage(
                                 input_tokens=usage_data.get("input_tokens", 0),
                                 output_tokens=usage_data.get("output_tokens", 0),
                                 cache_creation_input_tokens=usage_data.get(
@@ -570,7 +568,7 @@ def _replay_to_weave(result, weave_session) -> None:
                             tid = tb.get("id", "")
                             tc = tool_call_map.get(tid)
                             tool_output = tc.output if tc else ""
-                            with weave.start_tool(
+                            with start_tool(
                                 name=tb.get("name", "unknown"),
                                 arguments=json.dumps(tb.get("input", {})),
                                 tool_call_id=tid,

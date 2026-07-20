@@ -39,6 +39,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shlex
 import sys
 import tarfile
 from pathlib import Path
@@ -68,9 +69,28 @@ _DEFAULT_DEPS = [
     "datasets",
     "tenacity>=8",
     "tqdm",
-    "weave",
+    "weave>=0.53.1,<0.54",
     "pyyaml",
 ]
+
+_SANDBOX_ENV_KEYS = (
+    "WANDB_API_KEY",
+    "WANDB_PROJECT",
+    "WANDB_ENTITY",
+    "META_HARNESS_RUN_ID",
+    "WEAVE_DISABLED",
+)
+
+
+def _tracing_status(trace_env: dict[str, str]) -> str:
+    """Return a secret-free summary of tracing configuration."""
+    project = trace_env.get("WANDB_PROJECT", "")
+    disabled = bool(trace_env.get("WEAVE_DISABLED"))
+    state = "enabled" if project and not disabled else "disabled"
+    return (
+        f"{state} (project={project or 'unset'}, "
+        f"run_id={trace_env.get('META_HARNESS_RUN_ID', 'unset')})"
+    )
 
 
 def _make_tarball(src_dir: Path) -> bytes:
@@ -103,15 +123,22 @@ def _build_inner_cmd(
     seed: int,
     model: str,
     api_base: str | None,
-    wandb_key: str,
+    trace_env: dict[str, str],
     mode: str,
     num_epochs: int,
     temperature: float | None,
 ) -> str:
     """Build the bash command that runs inner_loop for one candidate in-sandbox."""
     n_train, n_val, n_test = get_dataset_sizes(dataset)
+    exports = [
+        f"export {key}={shlex.quote(value)}"
+        for key, value in trace_env.items()
+        if key in _SANDBOX_ENV_KEYS and value
+    ]
+    exports.append("export PYTHONPATH=$(pwd)")
     cmd = (
-        f"export WANDB_API_KEY={wandb_key} && export PYTHONPATH=$(pwd) && "
+        " && ".join(exports)
+        + " && "
         "python -m text_classification.inner_loop "
         f"--memory agents/{candidate}.py "
         f"--dataset {dataset} "
@@ -175,13 +202,22 @@ def run_candidates(
     num_epochs = int(il.get("num_epochs", 1))
     temperature = il.get("temperature")
 
-    wandb_key = os.environ.get("WANDB_API_KEY", "")
+    trace_env = {
+        key: value
+        for key in _SANDBOX_ENV_KEYS
+        if (value := os.environ.get(key, ""))
+    }
+    wandb_key = trace_env.get("WANDB_API_KEY", "")
     if not wandb_key:
         print(
             "  WARNING: WANDB_API_KEY not set in the kernel; sandbox inner_loop "
             "calls to W&B Inference will fail auth.",
             flush=True,
         )
+    print(
+        f"  sandbox: candidate Weave tracing {_tracing_status(trace_env)}",
+        flush=True,
+    )
 
     resolved_deps = deps if deps is not None else _DEFAULT_DEPS
 
@@ -218,7 +254,7 @@ def run_candidates(
                 seed=seed,
                 model=model,
                 api_base=api_base,
-                wandb_key=wandb_key,
+                trace_env=trace_env,
                 mode=mode,
                 num_epochs=num_epochs,
                 temperature=temperature,

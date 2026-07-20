@@ -22,6 +22,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -390,9 +391,9 @@ def _replay_to_weave(result: SessionResult, weave_session):
                     record_step(part.get("tokens", {}) or {})
 
             record_step()
-    except Exception:
+    except Exception as exc:
         # Tracing must never break the OpenCode workflow.
-        pass
+        print(f"  WARNING: OpenCode Weave replay failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------

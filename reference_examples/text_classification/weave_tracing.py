@@ -18,7 +18,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import os
 import threading
 from contextlib import contextmanager
@@ -137,6 +136,32 @@ _NOOP = _NoopCtx()
 # ---------------------------------------------------------------------------
 
 
+def _conversation_api():
+    """Return conversation SDK types across Weave 0.52 and 0.53+.
+
+    Weave 0.53 moved the agent conversation SDK from ``weave.session`` to the
+    public ``weave.conversation`` namespace. The context variable is needed
+    only by ``thread_local_turn`` because worker threads do not inherit the
+    parent conversation context.
+    """
+    try:
+        from weave.conversation import Message, Turn, Usage
+        from weave.conversation import conversation as conversation_module
+
+        return (
+            Message,
+            Usage,
+            Turn,
+            conversation_module._current_conversation,
+            True,
+        )
+    except ImportError:
+        from weave.session import session as session_module
+        from weave.session.session import Message, Turn, Usage
+
+        return Message, Usage, Turn, session_module._current_session, False
+
+
 def start_session(
     *,
     agent_name: str = "",
@@ -211,14 +236,21 @@ def thread_local_turn(session: Any, user_message: str = ""):
         return
 
     try:
-        from weave.session import session as _session_mod
-        from weave.session.session import Message, Turn
+        Message, _, Turn, current_session, is_conversation_sdk = _conversation_api()
     except ImportError:
         yield None
         return
 
-    sess_token = _session_mod._current_session.set(session)
-    turn = Turn(agent_name=session.agent_name, model=session.model)
+    sess_token = current_session.set(session)
+    turn_kwargs = {
+        "agent_name": session.agent_name,
+        "model": session.model,
+    }
+    if is_conversation_sdk:
+        turn_kwargs["continue_parent_trace"] = getattr(
+            session, "continue_parent_trace", False
+        )
+    turn = Turn(**turn_kwargs)
     if user_message:
         turn.messages.append(Message(role="user", content=user_message))
     try:
@@ -226,7 +258,7 @@ def thread_local_turn(session: Any, user_message: str = ""):
             yield turn
     finally:
         try:
-            _session_mod._current_session.reset(sess_token)
+            current_session.reset(sess_token)
         except Exception:
             pass
 
@@ -267,10 +299,10 @@ def start_tool(
 
 
 def make_message(role: str, content: str, **kwargs) -> Any:
-    """Build a weave.session.session.Message (or a plain dict when disabled)."""
+    """Build a Weave conversation Message (or a plain dict when disabled)."""
     if not weave_enabled():
         return {"role": role, "content": content, **kwargs}
-    from weave.session.session import Message
+    Message, _, _, _, _ = _conversation_api()
     return Message(role=role, content=content, **kwargs)  # type: ignore[arg-type]
 
 
@@ -280,13 +312,13 @@ def make_usage(
     cache_creation_input_tokens: int = 0,
     cache_read_input_tokens: int = 0,
 ) -> Any:
-    """Build a weave.session.session.Usage object (or a plain dict when disabled)."""
+    """Build a Weave conversation Usage object (or a dict when disabled)."""
     if not weave_enabled():
         return {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
         }
-    from weave.session.session import Usage
+    _, Usage, _, _, _ = _conversation_api()
     return Usage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
