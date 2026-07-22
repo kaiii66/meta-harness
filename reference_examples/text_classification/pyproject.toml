@@ -9,7 +9,7 @@ dependencies = [
     "openai",
     "tenacity>=8",
     "tqdm",
-    "weave",
+    "weave>=0.53.1,<0.54",
 ]
 
 [tool.uv]

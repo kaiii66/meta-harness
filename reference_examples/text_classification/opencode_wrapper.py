@@ -22,6 +22,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -44,6 +45,7 @@ class SessionResult:
     prompt: str
     text: str
     tool_calls: list = field(default_factory=list)
+    raw_events: list = field(default_factory=list)
     files_read: dict = field(default_factory=dict)
     files_written: dict = field(default_factory=dict)
     token_usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
@@ -167,9 +169,10 @@ def _write_agents_md(cwd: Path, skill_text: str, system_prompt: str | None):
 
 def _parse_events(stdout: str, base_dir: Path = None):
     """Parse opencode NDJSON events into (tool_calls, text, files_read,
-    files_written, token_usage, cost, session_id)."""
+    files_written, token_usage, cost, session_id, raw_events)."""
     base_dir = base_dir or Path.cwd()
     tool_calls = []
+    raw_events = []
     text_parts = []
     files_read = {}
     files_written = {}
@@ -186,6 +189,9 @@ def _parse_events(stdout: str, base_dir: Path = None):
             ev = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
+        if not isinstance(ev, dict):
+            continue
+        raw_events.append(ev)
         etype = ev.get("type")
         part = ev.get("part", {})
         if not session_id:
@@ -199,6 +205,7 @@ def _parse_events(stdout: str, base_dir: Path = None):
             is_error = state.get("status") not in ("completed", None)
             tool_calls.append({
                 "name": name,
+                "tool_id": part.get("callID", "") or part.get("id", ""),
                 "input": inp,
                 "output": str(out)[:500],
                 "is_error": bool(is_error),
@@ -212,7 +219,16 @@ def _parse_events(stdout: str, base_dir: Path = None):
                     rec["lines"] = str(out).count("\n") + 1
                 elif name in ("write", "edit", "patch"):
                     content = inp.get("content", "") or inp.get("newString", "") or ""
-                    files_written[rel] = {"lines_written": content.count("\n") + 1 if content else 0}
+                    content_text = (
+                        content
+                        if isinstance(content, str)
+                        else json.dumps(content, default=str)
+                    )
+                    files_written[rel] = {
+                        "lines_written": (
+                            content_text.count("\n") + 1 if content_text else 0
+                        )
+                    }
         elif etype == "text":
             t = part.get("text", "")
             if t:
@@ -231,6 +247,7 @@ def _parse_events(stdout: str, base_dir: Path = None):
         "token_usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
         "cost_usd": cost,
         "session_id": session_id,
+        "raw_events": raw_events,
     }
 
 
@@ -275,19 +292,108 @@ def _log_session(result: SessionResult, raw_stdout: str, log_dir: str, name: str
 
 
 def _replay_to_weave(result: SessionResult, weave_session):
-    """Best-effort replay of the session into the existing Weave proposer session."""
+    """Replay OpenCode events into the existing Weave proposer session.
+
+    OpenCode emits flat NDJSON parts. Events are buffered until ``step_finish``
+    so each completed agent step becomes an LLM span with its text, usage, and
+    nested tool calls. A final partial step is also recorded for failed or
+    interrupted runs.
+    """
     if weave_session is None:
         return
     try:
-        from claude_wrapper import _weave_enabled
-        if not _weave_enabled():
+        from weave_tracing import (
+            make_message,
+            make_usage,
+            start_llm,
+            start_tool,
+            weave_enabled,
+        )
+
+        if not weave_enabled():
             return
-        from weave.session.session import Message, Usage
+
+        provider_name = (
+            result.model.split("/", 1)[0] if "/" in result.model else DEFAULT_PROVIDER
+        )
+
         with weave_session.start_turn(user_message=result.prompt):
-            for tc in result.tool_calls:
-                pass  # tool spans optional; LLM-level summary below
-    except Exception:
-        pass
+            text_parts = []
+            tools_by_id = {}
+            tool_order = []
+            fallback_tool_index = 0
+
+            def record_step(tokens=None):
+                nonlocal text_parts, tools_by_id, tool_order
+                tokens = tokens or {}
+                cache = tokens.get("cache", {}) or {}
+                has_usage = any(
+                    int(tokens.get(key, 0) or 0) for key in ("input", "output")
+                )
+                if not text_parts and not tool_order and not has_usage:
+                    return
+
+                with start_llm(
+                    model=result.model or DEFAULT_MODEL_ID,
+                    provider_name=provider_name,
+                ) as llm:
+                    output_text = "".join(text_parts)
+                    output_messages = (
+                        [make_message("assistant", output_text)] if output_text else []
+                    )
+                    llm.record(
+                        input_messages=[make_message("user", result.prompt)],
+                        output_messages=output_messages,
+                        usage=make_usage(
+                            input_tokens=int(tokens.get("input", 0) or 0),
+                            output_tokens=int(tokens.get("output", 0) or 0),
+                            cache_creation_input_tokens=int(cache.get("write", 0) or 0),
+                            cache_read_input_tokens=int(cache.get("read", 0) or 0),
+                        ),
+                    )
+                    for tool_id in tool_order:
+                        tc = tools_by_id[tool_id]
+                        with start_tool(
+                            name=tc["name"],
+                            arguments=json.dumps(tc["input"], default=str),
+                            tool_call_id=tool_id,
+                        ) as tool:
+                            tool.result = tc["output"]
+
+                text_parts = []
+                tools_by_id = {}
+                tool_order = []
+
+            for event in result.raw_events:
+                etype = event.get("type", "")
+                part = event.get("part", {}) or {}
+
+                if etype == "text":
+                    text = part.get("text", "")
+                    if text:
+                        text_parts.append(text)
+                elif etype == "tool_use":
+                    state = part.get("state", {}) or {}
+                    fallback_tool_index += 1
+                    tool_id = (
+                        part.get("callID", "")
+                        or part.get("id", "")
+                        or f"opencode-tool-{fallback_tool_index}"
+                    )
+                    if tool_id not in tools_by_id:
+                        tool_order.append(tool_id)
+                    tools_by_id[tool_id] = {
+                        "name": part.get("tool", "unknown"),
+                        "input": state.get("input", {}) or {},
+                        "output": str(state.get("output", "") or ""),
+                    }
+                elif etype == "step_finish":
+                    record_step(part.get("tokens", {}) or {})
+
+            record_step()
+    except Exception as exc:
+        # Tracing must never break the OpenCode workflow.
+        print(f"  WARNING: OpenCode Weave replay failed: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +538,7 @@ def run(
         prompt=prompt,
         text=parsed["text"],
         tool_calls=parsed["tool_calls"],
+        raw_events=parsed["raw_events"],
         files_read=parsed["files_read"],
         files_written=parsed["files_written"],
         token_usage=parsed["token_usage"],
